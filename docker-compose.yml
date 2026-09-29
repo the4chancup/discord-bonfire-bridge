@@ -1,0 +1,19 @@
+services:
+  bonfire-bot:
+    build: .
+    env_file: .env
+    volumes:
+      - "./data:/data:ro"
+    restart: unless-stopped
+  discord-relay:
+    build: .
+    command: python relay.py
+    env_file: relay.env
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - STATE_DB=/state/relay.db
+    volumes:
+      - "./data:/data:ro"
+      # owned by the image's user (uid 10001): chown once on the host
+      - "./relay-state:/state"
+    restart: unless-stopped

@@ -1,0 +1,10 @@
+.env
+relay.env
+data/
+relay-state/
+__pycache__/
+*.pyc
+*.db
+*.db-*
+.venv/
+*.tmp
