@@ -124,18 +124,35 @@ check("non-owner unaffected by owner_id",
 # ---- plan_attachments ----
 A = lambda i, sz=100: {"filename": f"f{i}.txt", "size": sz}
 atts = [A(i) for i in range(3)]
-dl, sk = relay.plan_attachments(atts, True, 1000)
-check("allowed, all fit", len(dl) == 3 and sk == 0)
-dl, sk = relay.plan_attachments(atts, False, 1000)
-check("not allowed, all skipped", dl == [] and sk == 3)
-dl, sk = relay.plan_attachments([A(1), A(2, 5000), A(3)], True, 1000)
-check("oversized skipped, rest kept", [x["filename"] for x in dl] == ["f1.txt", "f3.txt"] and sk == 1)
-dl, sk = relay.plan_attachments([A(i) for i in range(12)], True, 1000)
-check("over limit: first 10 kept", len(dl) == 10 and sk == 2)
-dl, sk = relay.plan_attachments([], True, 1000)
-check("empty attachments", dl == [] and sk == 0)
-dl, sk = relay.plan_attachments([A(1, 5000), A(2, 100), *[A(i) for i in range(3, 13)]], True, 400)
-check("oversize + over limit mix", [x["filename"] for x in dl] == ["f2.txt"] + [f"f{i}.txt" for i in range(3, 12)] and sk == 2)
+MB = 1024 * 1024
+dl, sk = relay.plan_attachments(atts, None, 1000)
+check("allowed, all fit", len(dl) == 3 and sk == [])
+dl, sk = relay.plan_attachments(atts, "not a Bonfire user", 1000)
+check("blocked, all skipped with the block reason", dl == [] and sk == ["not a Bonfire user"] * 3)
+dl, sk = relay.plan_attachments([A(1), A(2, 5000), A(3)], None, 1000)
+check("oversized skipped, rest kept", [x["filename"] for x in dl] == ["f1.txt", "f3.txt"] and len(sk) == 1)
+dl, sk = relay.plan_attachments([A(i) for i in range(12)], None, 1000)
+check("over limit: first 10 kept", len(dl) == 10 and sk == ["over 10 per message"] * 2)
+dl, sk = relay.plan_attachments([], None, 1000)
+check("empty attachments", dl == [] and sk == [])
+dl, sk = relay.plan_attachments([A(1, 5000), A(2, 100), *[A(i) for i in range(3, 13)]], None, 400)
+check("oversize + over limit mix", [x["filename"] for x in dl] == ["f2.txt"] + [f"f{i}.txt" for i in range(3, 12)] and len(sk) == 2)
+dl, sk = relay.plan_attachments([A(1, 30 * MB), A(2)], None, 25 * MB)
+eq("oversize reason names the limit", sk, ["over 25 MB"])
+
+# ---- not_relayed_note ----
+eq("nothing skipped: no note", relay.not_relayed_note([]), "")
+eq("one file, singular", relay.not_relayed_note(["not a Bonfire user"]),
+   "\n[1 file not relayed (not a Bonfire user)]")
+eq("two files, plural", relay.not_relayed_note(["no upload permission"] * 2),
+   "\n[2 files not relayed (no upload permission)]")
+eq("mixed reasons, counted in first-seen order",
+   relay.not_relayed_note(["over 25 MB", "deleted on Discord", "over 25 MB"]),
+   "\n[3 files not relayed (2 over 25 MB, 1 deleted on Discord)]")
+eq("catch-up count parses the new note",
+   relay.noted_count("\n[sticker: x]\n[3 files not relayed (2 over 25 MB, 1 deleted on Discord)]"), 3)
+eq("catch-up count parses the old note", relay.noted_count("\n[1 file(s) not relayed]"), 1)
+eq("catch-up count without a note", relay.noted_count(""), 0)
 
 # ---- is_transient ----
 check("network error is transient", relay.is_transient(None))

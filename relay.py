@@ -206,19 +206,48 @@ def safe_path(path):
     return WEBHOOK_TOKEN_RE.sub(r"\1<token>", path)
 
 
-def plan_attachments(attachments, allowed, max_bytes, limit=MAX_ATTACHMENTS_PER_MESSAGE):
-    """Decide which attachments to relay. attachments: [{filename, size}, ...].
-    Returns (to_download, skipped_count)."""
+def too_large(max_bytes):
+    return f"over {max_bytes // (1024 * 1024)} MB"
+
+
+def plan_attachments(attachments, block, max_bytes, limit=MAX_ATTACHMENTS_PER_MESSAGE):
+    """Decide which attachments to relay. attachments: [{filename, size}, ...];
+    block: why the author can't upload, None if they can.
+    Returns (to_download, skipped_reasons), one reason per skipped file."""
     to_download = []
-    skipped = 0
+    skipped = []
     for att in attachments:
         if len(to_download) >= limit:
-            skipped += 1
-        elif not allowed or att["size"] > max_bytes:
-            skipped += 1
+            skipped.append(f"over {limit} per message")
+        elif block:
+            skipped.append(block)
+        elif att["size"] > max_bytes:
+            skipped.append(too_large(max_bytes))
         else:
             to_download.append(att)
     return to_download, skipped
+
+
+def not_relayed_note(reasons):
+    """'\\n[2 files not relayed (over 25 MB)]'; mixed reasons are counted in
+    first-seen order: '(2 over 25 MB, 1 deleted on Discord)'. '' if none."""
+    if not reasons:
+        return ""
+    counts = {}
+    for r in reasons:
+        counts[r] = counts.get(r, 0) + 1
+    why = next(iter(counts)) if len(counts) == 1 else ", ".join(f"{n} {r}" for r, n in counts.items())
+    n = len(reasons)
+    return f"\n[{n} file{'' if n == 1 else 's'} not relayed ({why})]"
+
+
+NOTED_RE = re.compile(r"\[(\d+) file(?:s|\(s\))? not relayed")
+
+
+def noted_count(suffix):
+    """Files counted in a stored note (also the pre-reason '[N file(s) not relayed]')."""
+    m = NOTED_RE.search(suffix or "")
+    return int(m.group(1)) if m else 0
 
 
 def attachment_ids_to_keep(relayed_pairs, current_discord_ids):
@@ -573,21 +602,22 @@ class Relay:
                 names[str(m["id"])] = member.get("nick") or m.get("global_name") or m.get("username") or str(m["id"])
         return lambda did: names.get(did)
 
-    async def author_can_upload(self, guild_id, channel_id, discord_id):
+    async def upload_block(self, guild_id, channel_id, discord_id):
+        """Why the author's Bonfire account can't upload here; None if it can."""
         fluxer_id = self.fluxer_id_for(discord_id)
         if fluxer_id is None:
-            return False
+            return "not a Bonfire user"
         member = await self.cache.get(
             ("member", guild_id, fluxer_id), lambda: self.bonfire.guild_member(guild_id, fluxer_id))
         if member is None:  # 404: not a member -> can't upload (cacheable)
-            return False
+            return "not in the Bonfire community"
         roles = await self.cache.get(("roles", guild_id), lambda: self.bonfire.guild_roles(guild_id))
         overwrites = await self.cache.get(("ow", channel_id), lambda: self.bonfire.channel_overwrites(channel_id))
         owner = await self.cache.get(("owner", guild_id), lambda: self.bonfire.guild_owner_id(guild_id))
         if roles is None:
             raise TransientError(f"roles for {guild_id} unreadable")
         perms = effective_permissions(guild_id, member.get("roles") or [], int(fluxer_id), roles, overwrites, owner)
-        return upload_allowed(perms, member, time.time() * 1000)
+        return None if upload_allowed(perms, member, time.time() * 1000) else "no upload permission"
 
     async def webhook_for(self, channel_id):
         row = self.state.get_webhook(channel_id)
@@ -644,13 +674,13 @@ class Relay:
         suffix = ""
         for sticker in getattr(message, "stickers", []) or []:
             suffix += f"\n[sticker: {sticker.name}]"
-        allowed = await self.author_can_upload(message.guild.id, message.channel.id, message.author.id)
+        block = await self.upload_block(message.guild.id, message.channel.id, message.author.id)
         att_inputs = [{"filename": a.filename, "size": a.size, "id": a.id, "_att": a}
                       for a in message.attachments]
         for snap in getattr(message, "message_snapshots", None) or []:
             att_inputs += [{"filename": a.filename, "size": a.size, "id": a.id, "_att": a}
                            for a in getattr(snap, "attachments", []) or []]
-        plan = plan_attachments(att_inputs, allowed, self.max_file_bytes)
+        plan = plan_attachments(att_inputs, block, self.max_file_bytes)
         emoji_ids = await self.known_emoji_ids(message.guild.id)
         lookup = self.mention_name_lookup(message=message)
         translated = translate_content(content, self.mention_map(), emoji_ids, lookup)
@@ -761,9 +791,9 @@ class Relay:
             log.warning("transient preparing msg %s: %s", message.id, e)
             return "transient"
         if self.dry_run:
-            full = translated + sticker_suffix + (f"\n[{skipped} file(s) not relayed]" if skipped else "")
+            full = translated + sticker_suffix + not_relayed_note(skipped)
             log.info("DRY-RUN would relay msg %s in #%s (%d chunk(s), %d file(s) copied, %d noted)",
-                     message.id, channel_id, len(split_content(full)) or 1, len(to_download), skipped)
+                     message.id, channel_id, len(split_content(full)) or 1, len(to_download), len(skipped))
             return "ok"
         # sticker-only and file-only messages still relay: judge the rendered
         # body (translated text + suffix), not just the translated text
@@ -783,10 +813,10 @@ class Relay:
         if not wid or not token:
             log.warning("no webhook for channel %s; msg %s transient", channel_id, message.id)
             return "transient"
-        suffix = sticker_suffix
-        not_relayed = skipped + gone
-        if not_relayed:
-            suffix += f"\n[{not_relayed} file(s) not relayed]"
+        note = not_relayed_note(skipped + ["deleted on Discord"] * gone)
+        if note:
+            log.info("msg %s in #%s: %s", message.id, channel_id, note.strip())
+        suffix = sticker_suffix + note
         full = translated + suffix
         chunks = split_content(full)
         if not has_relayable(full, files):
@@ -810,24 +840,28 @@ class Relay:
         replacement fully, then delete the relayed messages and post it. Only then
         is the mapping updated; nothing is deleted if the replacement is empty."""
         # re-check the author's upload rule and download what survives it
-        allowed = False
+        block = "upload check unavailable"
         channel = self.channels.get(channel_id)
         if channel is not None and row.get("author_discord_id") is not None:
-            allowed = await self.author_can_upload(channel.guild.id, channel_id, row["author_discord_id"])
+            block = await self.upload_block(channel.guild.id, channel_id, row["author_discord_id"])
         files = []
-        missing = 0
+        missing = []
         for att in current_atts or []:
-            if not allowed or int(att.get("size", 0)) > self.max_file_bytes:
-                missing += 1
+            if block:
+                missing.append(block)
+                continue
+            if int(att.get("size", 0)) > self.max_file_bytes:
+                missing.append(too_large(self.max_file_bytes))
                 continue
             data = await self.download_url(att["url"])
             if data is None:
-                missing += 1
+                missing.append("deleted on Discord")
                 continue
             files.append((att.get("filename", "file"), data, att.get("content_type"), int(att["id"])))
-        new_content = content
-        if missing:
-            new_content += f"\n[{missing} file(s) not relayed]"
+        note = not_relayed_note(missing)
+        if note:
+            log.info("repost of discord msg %s: %s", discord_id, note.strip())
+        new_content = content + note
         if not has_relayable(new_content, files):
             log.info("repost of discord msg %s would be empty; keeping the old copy", discord_id)
             return True
@@ -1114,7 +1148,7 @@ class Relay:
             if self.dry_run:
                 _, _, (to_dl, skipped), _, _ = await self.build_content(msg)
                 n_files += len(to_dl)
-                n_noted += skipped
+                n_noted += len(skipped)
                 n_relayed += 1
             else:
                 outcome = await self.relay_message(msg)
@@ -1125,8 +1159,7 @@ class Relay:
                     posted = self.state.get_message(msg.id)
                     if posted:
                         n_files += len(posted["attachments"])
-                        noted = re.search(r"\[(\d+) file\(s\) not relayed\]", posted["suffix"] or "")
-                        n_noted += int(noted.group(1)) if noted else 0
+                        n_noted += noted_count(posted["suffix"])
                 # 'permanent' is logged inside relay_message and skipped
             self.state.set_cursor(channel_id, msg.id)
         log.info("channel #%s (%s): %d Discord message(s) since cursor, %d already on Bonfire, "

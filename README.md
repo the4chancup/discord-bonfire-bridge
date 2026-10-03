@@ -37,7 +37,8 @@ the same-ID Bonfire channel through a per-channel webhook named
   migrated history is never touched by a Discord delete;
 - attachments are copied only when the mapped Bonfire member is allowed to
   upload there (`SEND_MESSAGES` + `ATTACH_FILES`, not timed out: Fluxer's own
-  rule) and fit `RELAY_MAX_FILE_BYTES` (default 25 MiB);
+  rule) and fit `RELAY_MAX_FILE_BYTES` (default 25 MiB); a skipped file
+  leaves a note with the reason, e.g. `[1 file not relayed (not a Bonfire user)]`;
 - no pings: everything posts with `allowed_mentions: {"parse": [],
   "replied_user": false}`;
 - `<@discord_id>` mentions become `<@fluxer_id>` via the accounts map
